@@ -1,0 +1,5 @@
+config.json
+watchlist.json*
+media/
+*.log
+publish/

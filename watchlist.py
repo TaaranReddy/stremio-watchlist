@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""WhatsApp "🎬 Watchlist" group → Stremio catalog addon. Stdlib only, zero cloud tokens.
+
+Drop anything in the group: a title ("rocky"), an IMDb link, a caption, or a screenshot/poster.
+  text/link  → Cinemeta search (Stremio's own free metadata API)
+  image      → tesseract OCR → Cinemeta; no hit → local Ollama vision (qwen2.5vl:7b, ₹0)
+  "-rocky"   → removes the item
+The bot confirms in the group with a 🤖-prefixed reply (those are ignored on re-read).
+Stremio shows two rows on Board/Discover: "🎬 WhatsApp Watchlist" (Movies / Series).
+"""
+import base64, difflib, json, os, re, subprocess, threading, time, urllib.parse, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.path.expanduser('~')
+DIR = os.path.dirname(os.path.abspath(__file__))
+CFG = json.load(open(os.path.join(DIR, 'config.json')))
+GROUP, TOKEN, PORT = CFG['group'], CFG['token'], CFG.get('port', 7171)
+BRIDGE = 'http://127.0.0.1:3000'
+DB = os.path.join(DIR, 'watchlist.json')
+MEDIA = os.path.join(DIR, 'media'); os.makedirs(MEDIA, exist_ok=True)
+NODE = f'{HOME}/.hermes/node/bin/node'
+HELPER = f'{HOME}/.hermes/scripts/whatsapp-bridge/watchlist-media.mjs'
+BOT = '🤖'
+lock = threading.Lock()
+
+
+def load():
+    try: return json.load(open(DB))
+    except Exception: return {'items': [], 'seen': []}
+
+def save(db):
+    tmp = DB + '.tmp'; json.dump(db, open(tmp, 'w'), indent=1, ensure_ascii=False); os.replace(tmp, DB)
+
+def publish(db):
+    """Static addon in docs/ → GitHub Pages, so Apple TV/phone work with no tunnel or server."""
+    docs = os.path.join(DIR, 'docs'); os.makedirs(f'{docs}/catalog/movie', exist_ok=True); os.makedirs(f'{docs}/catalog/series', exist_ok=True)
+    json.dump(MANIFEST, open(f'{docs}/manifest.json', 'w'), ensure_ascii=False)
+    for typ in ('movie', 'series'):
+        json.dump(catalog(db['items'], typ), open(f'{docs}/catalog/{typ}/wa-watchlist.json', 'w'), ensure_ascii=False)
+    open(f'{docs}/.nojekyll', 'w').close()
+    git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60)
+    git('add', 'docs'); 
+    if git('diff', '--cached', '--quiet').returncode:
+        git('commit', '-qm', 'watchlist update'); r = git('push', '-q', 'origin', 'main'); log('published', r.returncode, r.stderr.strip()[:200])
+
+def catalog(items, typ):
+    return {'metas': [{'id': i['id'], 'type': i['type'], 'name': i['name'], 'poster': i.get('poster'),
+                       'releaseInfo': i.get('year')} for i in items if i['type'] == typ]}
+
+def get(url, data=None, timeout=20):
+    req = urllib.request.Request(url, data=json.dumps(data).encode() if data else None,
+                                 headers={'content-type': 'application/json', 'user-agent': 'wa-watchlist'})
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+def log(*a): print(time.strftime('%H:%M:%S'), *a, flush=True)
+
+# ─── identification ─────────────────────────────────────────────────────────
+def cinemeta_meta(tt):
+    for typ in ('movie', 'series'):
+        try:
+            m = get(f'https://v3-cinemeta.strem.io/meta/{typ}/{tt}.json').get('meta')
+            if m and m.get('name'): return typ, m
+        except Exception: pass
+    return None
+
+def search(q, hint=None):
+    """Best Cinemeta hit for q across movie+series, with a similarity score."""
+    q = re.sub(r'\s+', ' ', q).strip()
+    if len(q) < 2: return None
+    per_type = {}
+    for typ in ('movie', 'series'):
+        try: metas = get(f'https://v3-cinemeta.strem.io/catalog/{typ}/top/search={urllib.parse.quote(q)}.json').get('metas', [])
+        except Exception: continue
+        for rank, m in enumerate(metas[:5]):
+            name = m['name'].lower()
+            sim = difflib.SequenceMatcher(None, q.lower(), name).ratio()
+            if name.startswith(q.lower() + ':') or name.startswith(q.lower() + ' -'): sim = max(sim, 0.9)  # "Frieren: Beyond…"
+            score = sim - rank * 0.03 + (0.1 if hint == typ else 0)
+            if typ not in per_type or score > per_type[typ][0]: per_type[typ] = (score, typ, m, sim)
+    cands = [c for c in per_type.values() if c[3] >= 0.5]
+    if hint and hint in per_type and per_type[hint][3] >= 0.6: return per_type[hint]  # "anime"/"series"/"movie" said explicitly
+    if len(cands) == 2 and not hint and abs(cands[0][0] - cands[1][0]) < 0.15:
+        # movie-vs-series near tie ("frieren"): obscure namesakes lose to the popular title
+        def pop(c):
+            try: return get(f'https://v3-cinemeta.strem.io/meta/{c[1]}/{c[2]["id"]}.json')['meta'].get('popularities', {}).get('moviedb', 0) or 0
+            except Exception: return 0
+        return max(cands, key=pop)
+    return max(per_type.values(), default=None, key=lambda c: c[0])
+
+def identify_text(text):
+    tt = re.search(r'tt\d{6,9}', text)
+    if tt and (r := cinemeta_meta(tt.group())): return r
+    hint = 'series' if re.search(r'\b(series|show|season|anime|tv|s\d+e\d+)\b', text, re.I) else (
+           'movie' if re.search(r'\bmovie|film\b', text, re.I) else None)
+    clean = re.sub(r'https?://\S+|\b(watch|movie|film|series|show|anime|season \d+|recommend(ed)?|must|this)\b', ' ', text, flags=re.I)
+    best = search(clean, hint)
+    return (best[1], best[2]) if best and best[3] >= 0.5 else None
+
+def ocr_lines(path):
+    try: out = subprocess.run(['tesseract', path, '-', '--psm', '3'], capture_output=True, text=True, timeout=60).stdout
+    except Exception: return []
+    lines = [re.sub(r'[^\w\s:&\'-]', '', l).strip() for l in out.splitlines()]
+    return sorted({l for l in lines if 3 <= len(l) <= 60 and sum(c.isalpha() for c in l) >= 3}, key=len, reverse=True)[:6]
+
+def vision_guess(path):
+    try:
+        b64 = base64.b64encode(open(path, 'rb').read()).decode()
+        r = get('http://127.0.0.1:11434/api/generate', {
+            'model': CFG.get('vision_model', 'qwen2.5vl:7b'), 'stream': False, 'images': [b64],
+            'options': {'num_predict': 30, 'temperature': 0},
+            'prompt': 'This is a screenshot, poster or still from a movie, TV series or anime. '
+                      'Reply with ONLY its official English title, nothing else. If unknown reply UNKNOWN.'}, timeout=180)
+        g = r.get('response', '').strip().strip('"*.').splitlines()[0] if r.get('response') else ''
+        return '' if 'UNKNOWN' in g.upper() else g
+    except Exception as e:
+        log('vision failed', e); return ''
+
+def identify_image(msg_id, caption):
+    if caption and caption not in ('[image]', '[video]') and (r := identify_text(caption)): return r, 'caption'
+    try: path = subprocess.run([NODE, HELPER, msg_id, MEDIA], capture_output=True, text=True, timeout=60,
+                               cwd=os.path.dirname(HELPER)).stdout.strip()
+    except Exception: path = ''
+    if not path: return None, 'no-media'
+    hits = [b for l in ocr_lines(path) if (b := search(l)) and b[3] >= 0.75]
+    if hits:
+        b = max(hits, key=lambda x: x[0]); return (b[1], b[2]), 'ocr'
+    if (g := vision_guess(path)) and (b := search(g)) and b[3] >= 0.5: return (b[1], b[2]), f'vision:{g}'
+    return None, 'unrecognised'
+
+# ─── poll loop ──────────────────────────────────────────────────────────────
+def reply(text):
+    try: get(f'{BRIDGE}/send', {'chatId': GROUP, 'message': f'{BOT} {text}'})
+    except Exception as e: log('reply failed', e)
+
+def process(db, m):
+    body = (m.get('body') or '').strip()
+    if body.startswith(BOT) or body.startswith('[reaction'): return
+    if body.startswith('-') and len(body) > 2:   # removal
+        q = body[1:].strip().lower()
+        hit = max(db['items'], default=None, key=lambda i: difflib.SequenceMatcher(None, q, i['name'].lower()).ratio())
+        if hit and difflib.SequenceMatcher(None, q, hit['name'].lower()).ratio() > 0.5:
+            db['items'].remove(hit); reply(f'Removed {hit["name"]}')
+        return
+    if m.get('hasMedia'): res, how = identify_image(m['id'], body)
+    elif body: res, how = identify_text(body), 'text'
+    else: return
+    if not res:
+        reply(f"Couldn't identify that ({how}). Send the title as text and I'll add it."); return
+    typ, meta = res
+    if any(i['id'] == meta['id'] for i in db['items']):
+        reply(f'Already on the list: {meta["name"]}'); return
+    db['items'].insert(0, {'id': meta['id'], 'type': typ, 'name': meta['name'], 'poster': meta.get('poster'),
+                           'year': meta.get('releaseInfo') or meta.get('year'), 'added': int(time.time()), 'via': how})
+    log('added', meta['name'], typ, how)
+    reply(f'Added to Stremio → {meta["name"]} ({meta.get("releaseInfo") or meta.get("year") or "?"}) · {"Series" if typ == "series" else "Movie"}')
+
+def poll():
+    first = not os.path.exists(DB)
+    while True:
+        try:
+            msgs = sorted(get(f'{BRIDGE}/chat/{urllib.parse.quote(GROUP)}/messages'), key=lambda m: m.get('timestamp', 0))
+            with lock:
+                db = load(); seen = set(db['seen']); before = json.dumps(db['items'])
+                for m in msgs:
+                    if m['id'] in seen: continue
+                    seen.add(m['id'])
+                    if not first:
+                        try: process(db, m)
+                        except Exception as e: log('process error', m['id'], e)
+                db['seen'] = list(seen)[-2000:]; save(db); first = False
+                if json.dumps(db['items']) != before: publish(db)
+        except Exception as e: log('poll error', e)
+        time.sleep(CFG.get('poll_s', 45))
+
+# ─── Stremio addon ──────────────────────────────────────────────────────────
+MANIFEST = {
+    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.0.0', 'name': '🎬 WhatsApp Watchlist',
+    'description': 'Everything dropped in the WhatsApp "🎬 Watchlist" group.',
+    'resources': ['catalog'], 'types': ['movie', 'series'], 'idPrefixes': ['tt'],
+    'catalogs': [{'type': 'movie', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
+                 {'type': 'series', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'}],
+    'behaviorHints': {'configurable': False},
+}
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def send(self, obj, code=200):
+        b = json.dumps(obj).encode()
+        self.send_response(code); self.send_header('content-type', 'application/json')
+        self.send_header('access-control-allow-origin', '*'); self.send_header('cache-control', 'max-age=60')
+        self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        parts = self.path.split('?')[0].strip('/').split('/')
+        if not parts or parts[0] != TOKEN: return self.send({'err': 'not found'}, 404)
+        rest = '/'.join(parts[1:])
+        if rest == 'manifest.json': return self.send(MANIFEST)
+        if (mt := re.fullmatch(r'catalog/(movie|series)/wa-watchlist(?:/[^/]*)?\.json', rest)):
+            with lock: items = load()['items']
+            return self.send(catalog(items, mt.group(1)))
+        self.send({'err': 'not found'}, 404)
+
+if __name__ == '__main__':
+    publish(load())
+    threading.Thread(target=poll, daemon=True).start()
+    log(f'addon on :{PORT}')
+    ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
