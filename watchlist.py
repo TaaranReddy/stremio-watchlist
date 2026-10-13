@@ -9,6 +9,7 @@ The bot confirms in the group with a 🤖-prefixed reply (those are ignored on r
 Stremio shows two rows on Board/Discover: "🎬 WhatsApp Watchlist" (Movies / Series).
 """
 import base64, difflib, json, os, re, subprocess, threading, time, urllib.parse, urllib.request
+import recs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser('~')
@@ -37,6 +38,7 @@ def publish(db):
     json.dump(MANIFEST, open(f'{docs}/manifest.json', 'w'), ensure_ascii=False)
     for typ in ('movie', 'series'):
         json.dump(catalog(db['items'], typ), open(f'{docs}/catalog/{typ}/wa-watchlist.json', 'w'), ensure_ascii=False)
+        json.dump({'metas': db.get('recs', {}).get(typ, [])}, open(f'{docs}/catalog/{typ}/for-you.json', 'w'), ensure_ascii=False)
     open(f'{docs}/.nojekyll', 'w').close()
     git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60)
     git('add', 'docs'); 
@@ -44,8 +46,29 @@ def publish(db):
         git('commit', '-qm', 'watchlist update'); r = git('push', '-q', 'origin', 'main'); log('published', r.returncode, r.stderr.strip()[:200])
 
 def catalog(items, typ):
-    return {'metas': [{'id': i['id'], 'type': i['type'], 'name': i['name'], 'poster': i.get('poster'),
-                       'releaseInfo': i.get('year')} for i in items if i['type'] == typ]}
+    out = []
+    for i in items:
+        if i['type'] != typ: continue
+        m = {'id': i['id'], 'type': typ, 'name': i['name'], 'poster': recs.RPDB.format(i['id']), 'releaseInfo': i.get('year')}
+        if i.get('rating'): m['imdbRating'] = str(i['rating'])
+        if i.get('genres'): m['genres'] = i['genres']
+        m['description'] = ' · '.join(x for x in [f"⭐ {i['rating']} IMDb" if i.get('rating') else '', 'From your WhatsApp list'] if x) + (f"\n\n{i['plot']}" if i.get('plot') else '')
+        out.append(m)
+    return {'metas': out}
+
+def refresh(db):
+    """Enrich watchlist with IMDb ★/genres and rebuild For You. ~2 s of free IMDb GraphQL, no tokens."""
+    try:
+        info = recs.ratings([i['id'] for i in db['items'] if 'rating' not in i])
+        for i in db['items']:
+            if (n := info.get(i['id'])):
+                i['rating'] = (n.get('ratingsSummary') or {}).get('aggregateRating')
+                i['genres'] = [g['text'] for g in ((n.get('genres') or {}).get('genres') or [])]
+                i['plot'] = ((n.get('plot') or {}).get('plotText') or {}).get('plainText') or ''
+        lib = recs.library(CFG['stremio_authkey']) if CFG.get('stremio_authkey') else []
+        db['recs'] = recs.recommend(lib, db['items']); db['recs_at'] = int(time.time())
+        log('recs', {k: len(v) for k, v in db['recs'].items()})
+    except Exception as e: log('refresh failed', e)
 
 def get(url, data=None, timeout=20):
     req = urllib.request.Request(url, data=json.dumps(data).encode() if data else None,
@@ -168,17 +191,21 @@ def poll():
                         try: process(db, m)
                         except Exception as e: log('process error', m['id'], e)
                 db['seen'] = list(seen)[-2000:]; save(db); first = False
-                if json.dumps(db['items']) != before: publish(db)
+                changed = json.dumps(db['items']) != before
+                if changed or time.time() - db.get('recs_at', 0) > CFG.get('recs_every_s', 6 * 3600):
+                    refresh(db); save(db); publish(db)
         except Exception as e: log('poll error', e)
         time.sleep(CFG.get('poll_s', 45))
 
 # ─── Stremio addon ──────────────────────────────────────────────────────────
 MANIFEST = {
-    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.0.0', 'name': '🎬 WhatsApp Watchlist',
-    'description': 'Everything dropped in the WhatsApp "🎬 Watchlist" group.',
+    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.1.0', 'name': '🎬 WhatsApp Watchlist',
+    'description': 'Your WhatsApp "🎬 Watchlist" group + For You picks from what you watch. IMDb ★ on every poster.',
     'resources': ['catalog'], 'types': ['movie', 'series'], 'idPrefixes': ['tt'],
     'catalogs': [{'type': 'movie', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
-                 {'type': 'series', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'}],
+                 {'type': 'series', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
+                 {'type': 'movie', 'id': 'for-you', 'name': '✨ For You'},
+                 {'type': 'series', 'id': 'for-you', 'name': '✨ For You'}],
     'behaviorHints': {'configurable': False},
 }
 
@@ -194,13 +221,14 @@ class H(BaseHTTPRequestHandler):
         if not parts or parts[0] != TOKEN: return self.send({'err': 'not found'}, 404)
         rest = '/'.join(parts[1:])
         if rest == 'manifest.json': return self.send(MANIFEST)
-        if (mt := re.fullmatch(r'catalog/(movie|series)/wa-watchlist(?:/[^/]*)?\.json', rest)):
-            with lock: items = load()['items']
-            return self.send(catalog(items, mt.group(1)))
+        if (mt := re.fullmatch(r'catalog/(movie|series)/(wa-watchlist|for-you)(?:/[^/]*)?\.json', rest)):
+            with lock: db = load()
+            if mt.group(2) == 'for-you': return self.send({'metas': db.get('recs', {}).get(mt.group(1), [])})
+            return self.send(catalog(db['items'], mt.group(1)))
         self.send({'err': 'not found'}, 404)
 
 if __name__ == '__main__':
-    publish(load())
+    _db = load(); refresh(_db); save(_db); publish(_db)
     threading.Thread(target=poll, daemon=True).start()
     log(f'addon on :{PORT}')
     ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
