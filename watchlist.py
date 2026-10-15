@@ -40,7 +40,8 @@ def publish(db):
         json.dump(catalog(db['items'], typ), open(f'{docs}/catalog/{typ}/wa-watchlist.json', 'w'), ensure_ascii=False)
         json.dump({'metas': db.get('recs', {}).get(typ, [])}, open(f'{docs}/catalog/{typ}/for-you.json', 'w'), ensure_ascii=False)
     open(f'{docs}/.nojekyll', 'w').close()
-    git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60)
+    env = {**os.environ, 'DEVELOPER_DIR': '/Library/Developer/CommandLineTools'}  # Xcode licence prompt breaks /usr/bin/git
+    git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60, env=env)
     git('add', 'docs'); 
     if git('diff', '--cached', '--quiet').returncode:
         git('commit', '-qm', 'watchlist update'); r = git('push', '-q', 'origin', 'main'); log('published', r.returncode, r.stderr.strip()[:200])
@@ -110,6 +111,49 @@ def search(q, hint=None):
         return max(cands, key=pop)
     return max(per_type.values(), default=None, key=lambda c: c[0])
 
+SOCIAL = re.compile(r'https?://(?:www\.)?(?:instagram\.com|tiktok\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|facebook\.com|fb\.watch)/\S+', re.I)
+
+def link_info(url):
+    """Reel/short → (caption text, thumbnail path). yt-dlp first; og:image scrape for restricted posts."""
+    text, thumb = '', ''
+    try:
+        r = subprocess.run(['yt-dlp', '--skip-download', '-J', url], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            j = json.loads(r.stdout); text = '\n'.join(x for x in [j.get('description') or '', j.get('title') or ''] if x)
+            thumb = j.get('thumbnail') or ''
+    except Exception as e: log('yt-dlp failed', e)
+    if not thumb:
+        try:
+            req = urllib.request.Request(url, headers={'user-agent': 'facebookexternalhit/1.1'})
+            html = urllib.request.urlopen(req, timeout=20).read().decode('utf-8', 'ignore')
+            for k in ('og:title', 'og:description'):
+                if (m := re.search(rf'property="{k}" content="([^"]*)"', html)): text += '\n' + __import__('html').unescape(m.group(1))
+            if (m := re.search(r'property="og:image" content="([^"]+)"', html)): thumb = m.group(1).replace('&amp;', '&')
+        except Exception as e: log('og scrape failed', e)
+    path = ''
+    if thumb:
+        try:
+            path = os.path.join(MEDIA, re.sub(r'\W', '_', url)[-60:] + '.jpg')
+            urllib.request.urlretrieve(thumb, path)
+        except Exception: path = ''
+    return text, path
+
+def identify_link(url):
+    text, path = link_info(url)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    cands = []
+    for l in lines[:15]:   # "🎬 The Notebook (2004)" / "Movie: X" / "#movietitle"
+        if (m := re.search(r'(?:🎬|🎥|🍿|movie\s*[:\-]|film\s*[:\-]|series\s*[:\-]|title\s*[:\-])\s*([^\n(|#]{2,60}?)\s*(?:\((\d{4})\))?(?:$|[|#\n])', l, re.I)):
+            cands.append(m.group(1))
+        cands += re.findall(r'^\s*([A-Z][^\n()]{1,50}?)\s*\((\d{4})\)', l) and [re.findall(r'^\s*([A-Z][^\n()]{1,50}?)\s*\((\d{4})\)', l)[0][0]] or []
+    for c in cands:
+        if (b := search(c)) and b[3] >= 0.6: return (b[1], b[2]), 'reel-caption'
+    if path:
+        hits = [b for l in ocr_lines(path) if (b := search(l)) and b[3] >= 0.75]
+        if hits: b = max(hits, key=lambda x: x[0]); return (b[1], b[2]), 'reel-ocr'
+        if (g := vision_guess(path)) and (b := search(g)) and b[3] >= 0.5: return (b[1], b[2]), f'reel-vision:{g}'
+    return None, 'reel'
+
 def identify_text(text):
     tt = re.search(r'tt\d{6,9}', text)
     if tt and (r := cinemeta_meta(tt.group())): return r
@@ -165,6 +209,10 @@ def process(db, m):
             db['items'].remove(hit); reply(f'Removed {hit["name"]}')
         return
     if m.get('hasMedia'): res, how = identify_image(m['id'], body)
+    elif body and (sm := SOCIAL.search(body)) and not re.search(r'tt\d{6,9}', body):
+        rest = SOCIAL.sub(' ', body).strip()
+        res, how = (identify_text(rest), 'text') if len(rest) > 2 else (None, '')
+        if not res: res, how = identify_link(sm.group())
     elif body: res, how = identify_text(body), 'text'
     else: return
     if not res:
