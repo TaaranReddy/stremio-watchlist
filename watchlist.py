@@ -39,6 +39,9 @@ def publish(db):
     for typ in ('movie', 'series'):
         json.dump(catalog(db['items'], typ), open(f'{docs}/catalog/{typ}/wa-watchlist.json', 'w'), ensure_ascii=False)
         json.dump({'metas': db.get('recs', {}).get(typ, [])}, open(f'{docs}/catalog/{typ}/for-you.json', 'w'), ensure_ascii=False)
+        for mode in ('recent', 'watched', 'continue'):
+            json.dump(library_catalog(db.get('library', []), typ, mode),
+                      open(f'{docs}/catalog/{typ}/{mode}.json', 'w'), ensure_ascii=False)
     open(f'{docs}/.nojekyll', 'w').close()
     env = {**os.environ, 'DEVELOPER_DIR': '/Library/Developer/CommandLineTools'}  # Xcode licence prompt breaks /usr/bin/git
     git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60, env=env)
@@ -57,8 +60,35 @@ def catalog(items, typ):
         out.append(m)
     return {'metas': out}
 
+def library_catalog(items, typ, mode):
+    """Reliable history rows sourced from Stremio's own synced library state."""
+    out = []
+    for i in sorted(items, key=lambda x: (x.get('state') or {}).get('lastWatched', ''), reverse=True):
+        if i.get('type') != typ or not str(i.get('_id', '')).startswith('tt'):
+            continue
+        st = i.get('state') or {}
+        seen = (st.get('flaggedWatched') or 0) > 0 or (st.get('timesWatched') or 0) > 0
+        partial = (st.get('timeOffset') or 0) > 0 and not seen
+        if mode == 'watched' and not seen:
+            continue
+        if mode == 'continue' and not partial:
+            continue
+        if mode == 'recent' and not st.get('lastWatched'):
+            continue
+        m = {
+            'id': i['_id'], 'type': typ, 'name': i.get('name') or i['_id'],
+            'poster': recs.RPDB.format(i['_id']),
+        }
+        if i.get('poster'): m['background'] = i['poster']
+        if i.get('year'): m['releaseInfo'] = str(i['year'])
+        label = {'watched': '✓ Watched', 'continue': '▶ Continue watching', 'recent': 'Recently watched'}[mode]
+        m['description'] = label
+        out.append(m)
+    return {'metas': out}
+
+
 def refresh(db):
-    """Enrich watchlist with IMDb ★/genres and rebuild For You. ~2 s of free IMDb GraphQL, no tokens."""
+    """Enrich watchlist, rebuild history rows and For You recommendations."""
     try:
         info = recs.ratings([i['id'] for i in db['items'] if 'rating' not in i])
         for i in db['items']:
@@ -67,8 +97,9 @@ def refresh(db):
                 i['genres'] = [g['text'] for g in ((n.get('genres') or {}).get('genres') or [])]
                 i['plot'] = ((n.get('plot') or {}).get('plotText') or {}).get('plainText') or ''
         lib = recs.library(CFG['stremio_authkey']) if CFG.get('stremio_authkey') else []
+        db['library'] = lib
         db['recs'] = recs.recommend(lib, db['items']); db['recs_at'] = int(time.time())
-        log('recs', {k: len(v) for k, v in db['recs'].items()})
+        log('library', len(lib), 'recs', {k: len(v) for k, v in db['recs'].items()})
     except Exception as e: log('refresh failed', e)
 
 def get(url, data=None, timeout=20):
@@ -247,13 +278,21 @@ def poll():
 
 # ─── Stremio addon ──────────────────────────────────────────────────────────
 MANIFEST = {
-    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.1.0', 'name': '🎬 WhatsApp Watchlist',
-    'description': 'Your WhatsApp "🎬 Watchlist" group + For You picks from what you watch. IMDb ★ on every poster.',
+    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.2.0', 'name': '🎬 Taaran Library',
+    'description': 'Reliable Stremio history, Continue Watching, completed titles, WhatsApp Watchlist and For You picks.',
     'resources': ['catalog'], 'types': ['movie', 'series'], 'idPrefixes': ['tt'],
-    'catalogs': [{'type': 'movie', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
-                 {'type': 'series', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
-                 {'type': 'movie', 'id': 'for-you', 'name': '✨ For You'},
-                 {'type': 'series', 'id': 'for-you', 'name': '✨ For You'}],
+    'catalogs': [
+        {'type': 'movie', 'id': 'continue', 'name': '▶️ Continue Watching'},
+        {'type': 'series', 'id': 'continue', 'name': '▶️ Continue Watching'},
+        {'type': 'movie', 'id': 'watched', 'name': '✅ Watched Movies'},
+        {'type': 'series', 'id': 'watched', 'name': '✅ Watched Series'},
+        {'type': 'movie', 'id': 'recent', 'name': '🕘 Recently Watched'},
+        {'type': 'series', 'id': 'recent', 'name': '🕘 Recently Watched'},
+        {'type': 'movie', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
+        {'type': 'series', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
+        {'type': 'movie', 'id': 'for-you', 'name': '✨ For You'},
+        {'type': 'series', 'id': 'for-you', 'name': '✨ For You'},
+    ],
     'behaviorHints': {'configurable': False},
 }
 
@@ -269,9 +308,12 @@ class H(BaseHTTPRequestHandler):
         if not parts or parts[0] != TOKEN: return self.send({'err': 'not found'}, 404)
         rest = '/'.join(parts[1:])
         if rest == 'manifest.json': return self.send(MANIFEST)
-        if (mt := re.fullmatch(r'catalog/(movie|series)/(wa-watchlist|for-you)(?:/[^/]*)?\.json', rest)):
+        if (mt := re.fullmatch(r'catalog/(movie|series)/(wa-watchlist|for-you|recent|watched|continue)(?:/[^/]*)?\.json', rest)):
             with lock: db = load()
-            if mt.group(2) == 'for-you': return self.send({'metas': db.get('recs', {}).get(mt.group(1), [])})
+            cat = mt.group(2)
+            if cat == 'for-you': return self.send({'metas': db.get('recs', {}).get(mt.group(1), [])})
+            if cat in ('recent', 'watched', 'continue'):
+                return self.send(library_catalog(db.get('library', []), mt.group(1), cat))
             return self.send(catalog(db['items'], mt.group(1)))
         self.send({'err': 'not found'}, 404)
 
