@@ -144,6 +144,18 @@ def search(q, hint=None):
 
 SOCIAL = re.compile(r'https?://(?:www\.)?(?:instagram\.com|tiktok\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|facebook\.com|fb\.watch)/\S+', re.I)
 
+# Titles that share a name with a real film/series but are never what someone means
+# when they drop a poster in the group ("The Conversation" tt1926875 = a 2012 talk show).
+JUNK_GENRES = {'talk-show', 'talk show', 'news', 'reality-tv', 'game-show'}
+
+def is_junk(meta):
+    g = {str(x).strip().lower() for x in ((meta or {}).get('genres') or [])}
+    return bool(g & JUNK_GENRES)
+
+def popularity(typ, tid):
+    try: return get(f'https://v3-cinemeta.strem.io/meta/{typ}/{tid}.json')['meta'].get('popularities', {}).get('moviedb', 0) or 0
+    except Exception: return 0
+
 def link_info(url):
     """Reel/short → (caption text, thumbnail path). yt-dlp first; og:image scrape for restricted posts."""
     text, thumb = '', ''
@@ -251,8 +263,20 @@ def process(db, m):
     typ, meta = res
     if any(i['id'] == meta['id'] for i in db['items']):
         reply(f'Already on the list: {meta["name"]}'); return
+    fuzzy = how.split(':')[0] in ('ocr', 'vision', 'link', 'caption')
+    if fuzzy and is_junk(meta):
+        # a poster matched a talk show / news / reality namesake: never the intended title
+        reply(f'That matched a {", ".join(meta.get("genres") or [])} — not adding it. Send the exact title if that was wrong.')
+        return
+    twin = next((i for i in db['items'] if i['name'].lower() == meta['name'].lower() and i['type'] != typ), None)
+    if twin:
+        # same title already stored as the other type — keep the real one, drop the namesake
+        if is_junk(meta) or (not is_junk(twin) and popularity(twin['type'], twin['id']) >= popularity(typ, meta['id'])):
+            reply(f'Already on the list: {twin["name"]} ({twin["type"]})'); return
+        db['items'].remove(twin); log('dropped namesake', twin['name'], twin['type'], twin['id'])
     db['items'].insert(0, {'id': meta['id'], 'type': typ, 'name': meta['name'], 'poster': meta.get('poster'),
-                           'year': meta.get('releaseInfo') or meta.get('year'), 'added': int(time.time()), 'via': how})
+                           'year': meta.get('releaseInfo') or meta.get('year'), 'added': int(time.time()), 'via': how,
+                           'rating': meta.get('imdbRating'), 'genres': meta.get('genres') or []})
     log('added', meta['name'], typ, how)
     reply(f'Added to Stremio → {meta["name"]} ({meta.get("releaseInfo") or meta.get("year") or "?"}) · {"Series" if typ == "series" else "Movie"}')
 
