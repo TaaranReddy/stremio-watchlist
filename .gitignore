@@ -3,3 +3,5 @@ watchlist.json*
 media/
 *.log
 publish/
+__pycache__/
+*.pyc
