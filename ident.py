@@ -7,7 +7,7 @@ Pipeline, for every input type:
   3. resolve          — each title → IMDb suggestion API (+ Cinemeta), checked against the year/type the
                         evidence gave, so a phrase like "For the Boys" can never become a 1991 film
 """
-import base64, difflib, glob, json, os, re, shutil, subprocess, tempfile, unicodedata, urllib.parse, urllib.request
+import html, base64, difflib, glob, json, os, re, shutil, subprocess, tempfile, unicodedata, urllib.parse, urllib.request
 
 HOME = os.path.expanduser('~')
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -141,6 +141,33 @@ def og_tags(url):
     return out
 
 
+def ig_slides(url, work):
+    """Photo carousels: yt-dlp can't fetch image slides, but the public /embed/captioned page lists them all."""
+    m = re.search(r'instagram\.com/(?:p|reel|reels)/([\w-]+)', url)
+    if not m: return []
+    try:
+        req = urllib.request.Request(f'https://www.instagram.com/p/{m.group(1)}/embed/captioned/', headers={'user-agent': 'Mozilla/5.0'})
+        h = urllib.request.urlopen(req, timeout=30).read().decode('utf-8', 'ignore')
+    except Exception as e:
+        log('ig embed failed', e); return []
+    h = re.sub(r'\\+u0025', '%', h)
+    h = re.sub(r'\\+/', '/', h)
+    h = re.sub(r'\\+"', '"', h)
+    urls, seen = [], set()
+    i = h.find('edge_sidecar_to_children')
+    for u in re.findall(r'"display_url":"(https://[^"]+)"', h[i:] if i >= 0 else ''):
+        u = html.unescape(u)
+        k = u.split('?')[0]
+        if k not in seen: seen.add(k); urls.append(u)
+    out = []
+    for n, u in enumerate(urls[:20]):
+        p = os.path.join(work, f's{n:02d}.jpg')
+        try:
+            urllib.request.urlretrieve(u, p); out.append(p)
+        except Exception as e: log('slide download failed', e)
+    return out
+
+
 def reel_evidence(url, work):
     """Everything we can learn about a reel/post: caption, OCR of frames/slides, speech, key frames."""
     ev = {'url': url, 'caption': '', 'uploader': '', 'ocr': '', 'transcript': '', 'images': []}
@@ -159,7 +186,9 @@ def reel_evidence(url, work):
         subprocess.run(['yt-dlp', '-q', '--no-warnings', '-f', 'b[height<=720]/bv*[height<=720]+ba/b', '--max-filesize', '150M',
                         '-o', os.path.join(work, 'm%(playlist_index|0)s.%(ext)s'), url], capture_output=True, timeout=240)
     except Exception as e: log('yt-dlp download failed', e)
-    files = sorted(glob.glob(os.path.join(work, 'm*')))
+    files = [f for f in sorted(glob.glob(os.path.join(work, 'm*'))) if not f.endswith('.part')]
+    if not any(f.endswith(('.mp4', '.webm', '.mkv', '.mov')) for f in files) and 'instagram.com' in url:
+        files += ig_slides(url, work)
     if not files and (thumb := (info or {}).get('thumbnail') or og.get('og:image')):
         try:
             p = os.path.join(work, 'thumb.jpg'); urllib.request.urlretrieve(thumb, p); files.append(p)
@@ -190,11 +219,12 @@ RULES = '''Rules:
 - Titles that only appear as CONTEXT do not count — e.g. a studio's or director's earlier works, "from the creator of X", "better than X", comparisons, credits screens. Mark those role "referenced".
 - Only titles actually evidenced in the caption, on-screen text, speech, or clearly readable posters. Never guess from vibes.
 - Hashtags, catchphrases and list headings are NOT titles ("Top 5 Rom Coms For the Boys", "for the boys", "must watch"). Account names are not titles.
-- Give the official English title as listed on IMDb, the original/romaji title if shown, the release year if stated or certain, and type movie|series (anime TV = series).
+- title = the official ENGLISH title (even if the image only shows the Japanese/romaji name — translate it to the known English release title); alt_title = the original/romaji title, the release year if stated or certain, and type movie|series (anime TV = series).
+- Remakes / shared titles (True Grit 1969 vs 2010, 3:10 to Yuma 1957 vs 2007): pick the version using the clues shown (IMDb rating, poster, actors, year). If you can't tell, set year null — never guess a year.
 - confidence = how sure you are this exact title is meant. Recognising a poster/still with no readable title text is rarely above 0.6.
 - If nothing is identifiable, return an empty list.'''
 
-SCHEMA = '{"titles":[{"title":"...","alt_title":"... or null","year":2004,"type":"movie|series","evidence":"caption|ocr|speech|poster","role":"recommended|referenced","confidence":0.0-1.0}]}'
+SCHEMA = '{"post":"short neutral label for the post, e.g. Top 5 rom-coms list / Westerns carousel / Anime clip: <title>","titles":[{"title":"...","alt_title":"... or null","year":2004,"type":"movie|series","evidence":"caption|ocr|speech|poster","role":"recommended|referenced","confidence":0.0-1.0}]}'
 
 
 def read_reel(ev):
@@ -214,7 +244,7 @@ SPEECH (Whisper transcript):
 
 {RULES}
 Reply JSON only: {SCHEMA}'''
-    return llm(prompt, ev['images']).get('titles') or []
+    return llm(prompt, ev['images'])
 
 
 def read_image(path, caption=''):
@@ -227,7 +257,7 @@ ON-SCREEN TEXT (Apple OCR):
 Which film / series / anime is this about? Use the OCR text first (screenshots of Instagram/Reddit posts usually name the title); otherwise recognise the poster/still.
 {RULES}
 Reply JSON only: {SCHEMA}'''
-    return llm(prompt, [b64(path, 1024)] if path else []).get('titles') or []
+    return llm(prompt, [b64(path, 1024)] if path else [])
 
 
 def read_text(text, context):
@@ -303,9 +333,11 @@ def resolve(t):
     if not cands: return None
     score, c, sim = max(cands.values(), key=lambda x: x[0])
     if sim < 0.75 and not (want_y and c['year'] and abs(c['year'] - want_y) <= 1): return None
-    r = cinemeta(c['type'], c['id'])
-    if r: return r
-    return c['type'], {'id': c['id'], 'name': c['name'], 'releaseInfo': str(c['year'] or ''), 'genres': []}
+    r = cinemeta(c['type'], c['id']) or (c['type'], {'id': c['id'], 'name': c['name'], 'releaseInfo': str(c['year'] or ''), 'genres': []})
+    en = t.get('title') or ''
+    if en and _sim(en, r[1]['name']) < 0.6 and re.search(r'[A-Za-z]', en):
+        r[1]['display'] = en          # "Tensei Shita Daiseijo wa…" → "A Tale of the Secret Saint"
+    return r
 
 
 def resolve_all(titles):
@@ -315,7 +347,8 @@ def resolve_all(titles):
         if t.get('role') == 'referenced': log('  skip referenced', t['title']); continue
         try: conf = float(t.get('confidence', 1))
         except Exception: conf = 1
-        if conf < 0.7: log('  skip low-confidence', t['title'], conf); continue
+        # a poster/still with no readable title is a guess — it has to be near-certain
+        if conf < (0.85 if t.get('evidence') == 'poster' else 0.7): log('  skip low-confidence', t['title'], t.get('evidence'), conf); continue
         r = resolve(t)
         log('  resolve', t.get('title'), t.get('year'), '→', r and (r[1]['name'], r[1].get('releaseInfo'), r[1]['id']))
         if r and r[1]['id'] not in seen:
@@ -328,13 +361,30 @@ def identify_reel(url):
     try:
         ev = reel_evidence(url, work)
         log('reel', url, 'caption', len(ev['caption']), 'ocr', len(ev['ocr']), 'speech', len(ev['transcript']), 'frames', len(ev['images']))
-        return resolve_all(read_reel(ev))
+        r = read_reel(ev)
+        return resolve_all(r.get('titles') or []), post_label(r, ev)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def post_label(r, ev=None):
+    label = (r.get('post') or '').strip().rstrip('.')
+    who = ((ev or {}).get('uploader') or '').strip()
+    return f'{label} (@{who})' if label and who and who.lower() not in label.lower() else label
+
+
 def identify_image(path, caption=''):
-    return resolve_all(read_image(path, caption))
+    r = read_image(path, caption)
+    titles = r.get('titles') or []
+    # No readable title, only a recognised poster/still → the guess must repeat on two more independent reads
+    # (one test still came back "Mr. Nobody" on one read and "Minority Report" on the next).
+    if titles and all(t.get('evidence') == 'poster' for t in titles):
+        keys = lambda rr: {norm(t.get('title') or '') for t in (rr.get('titles') or [])}
+        first = keys(r)
+        for _ in range(2):
+            if keys(read_image(path, caption)) != first:
+                log('  skip unstable poster guess', [t.get('title') for t in titles]); return [], post_label(r)
+    return resolve_all(titles), post_label(r)
 
 
 def identify_video(path, caption=''):
@@ -343,6 +393,7 @@ def identify_video(path, caption=''):
     try:
         ev = media_evidence([path], work)
         ev['caption'] = caption
-        return resolve_all(read_reel(ev))
+        r = read_reel(ev)
+        return resolve_all(r.get('titles') or []), post_label(r)
     finally:
         shutil.rmtree(work, ignore_errors=True)

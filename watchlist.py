@@ -50,6 +50,25 @@ def publish(db):
     git('add', 'docs'); 
     if git('diff', '--cached', '--quiet').returncode:
         git('commit', '-qm', 'watchlist update'); r = git('push', '-q', 'origin', 'main'); log('published', r.returncode, r.stderr.strip()[:200])
+        if r.returncode == 0: threading.Thread(target=check_pages, daemon=True).start()
+
+GH = '/opt/homebrew/bin/gh'
+REPO = 'TaaranReddy/stremio-watchlist'
+
+def check_pages(tries=3):
+    """GitHub Pages sometimes fails a build when pushes land close together, leaving Stremio on a stale
+    catalog with no error anywhere. Wait for the build of HEAD; if it errored, ask GitHub to rebuild."""
+    head = subprocess.run(['git', '-C', DIR, 'rev-parse', 'HEAD'], capture_output=True, text=True).stdout.strip()
+    for _ in range(tries):
+        for _ in range(20):
+            time.sleep(30)
+            r = subprocess.run([GH, 'api', f'repos/{REPO}/pages/builds/latest', '--jq', '.status + " " + .commit'],
+                               capture_output=True, text=True, timeout=60).stdout.split()
+            if len(r) == 2 and r[1] == head and r[0] in ('built', 'errored'): break
+        if len(r) == 2 and r[0] == 'built' and r[1] == head: log('pages built', head[:7]); return
+        log('pages build', r, '→ requesting rebuild')
+        subprocess.run([GH, 'api', '-X', 'POST', f'repos/{REPO}/pages/builds'], capture_output=True, timeout=60)
+    log('pages still not built after retries', head[:7])
 
 def catalog(items, typ):
     out = []
@@ -58,7 +77,7 @@ def catalog(items, typ):
         m = {'id': i['id'], 'type': typ, 'name': i['name'], 'poster': recs.RPDB.format(i['id']), 'releaseInfo': i.get('year')}
         if i.get('rating'): m['imdbRating'] = str(i['rating'])
         if i.get('genres'): m['genres'] = i['genres']
-        m['description'] = ' · '.join(x for x in [f"⭐ {i['rating']} IMDb" if i.get('rating') else '', 'From your WhatsApp list'] if x) + (f"\n\n{i['plot']}" if i.get('plot') else '')
+        m['description'] = ' · '.join(x for x in [f"⭐ {i['rating']} IMDb" if i.get('rating') else '', f"From WhatsApp: {i['src']}" if i.get('src') else 'From your WhatsApp list'] if x) + (f"\n{i['orig']}" if i.get('orig') else '') + (f"\n\n{i['plot']}" if i.get('plot') else '')
         out.append(m)
     return {'metas': out}
 
@@ -171,11 +190,17 @@ def popularity(typ, tid):
     except Exception: return 0
 
 # ─── poll loop ──────────────────────────────────────────────────────────────
-def reply(text):
-    try: get(f'{BRIDGE}/send', {'chatId': GROUP, 'message': f'{BOT} {text}'})
+def reply(text, to=None):
+    """Post in the group; with `to` (the original message) it's a WhatsApp reply quoted under that post."""
+    body = {'chatId': GROUP, 'message': f'{BOT} {text}'}
+    if to and to.get('id'):
+        body['quoted'] = {'id': to['id'], 'fromMe': to.get('from') == 'me' or bool(to.get('fromMe')),
+                          'participant': None if to.get('from') == 'me' else to.get('from'),
+                          'text': (to.get('body') or '')[:200]}
+    try: get(f'{BRIDGE}/send', body)
     except Exception as e: log('reply failed', e)
 
-def add_item(db, typ, meta, how):
+def add_item(db, typ, meta, how, src='', pos=0):
     """→ 'added' | 'dup' | 'junk'. Keeps one entry per title, drops talk-show/news namesakes."""
     if any(i['id'] == meta['id'] for i in db['items']): return 'dup'
     if is_junk(meta): return 'junk'
@@ -183,14 +208,40 @@ def add_item(db, typ, meta, how):
     if twin:
         if not is_junk(twin) and popularity(twin['type'], twin['id']) >= popularity(typ, meta['id']): return 'dup'
         db['items'].remove(twin); log('dropped namesake', twin['name'], twin['type'], twin['id'])
-    db['items'].insert(0, {'id': meta['id'], 'type': typ, 'name': meta['name'], 'poster': meta.get('poster'),
+    db['items'].insert(pos, {'id': meta['id'], 'type': typ, 'name': meta.get('display') or meta['name'], 'poster': meta.get('poster'),
+                           'orig': meta['name'] if meta.get('display') else None, 'src': src,
                            'year': meta.get('releaseInfo') or meta.get('year'), 'added': int(time.time()), 'via': how,
                            'rating': meta.get('imdbRating'), 'genres': meta.get('genres') or []})
     log('added', meta['name'], typ, how)
     return 'added'
 
 def label(typ, meta):
-    return f'{meta["name"]} ({meta.get("releaseInfo") or meta.get("year") or "?"}) · {"Series" if typ == "series" else "Movie"}'
+    """'Hitch (2005) · Movie'. Romaji-only IMDb names get the English title alongside."""
+    name = meta['name'] if not meta.get('display') else f"{meta['display']} — {meta['name']}"
+    year = str(meta.get('releaseInfo') or meta.get('year') or '').replace('–', '-').rstrip('-')
+    return f'{name}{f" ({year})" if year else ""} · {"Series" if typ == "series" else "Movie"}'
+
+STATUS = {'added': '✅ added', 'dup': '☑️ already on list', 'junk': '⛔ skipped (talk show/news namesake)'}
+KIND = {'reel': 'link', 'image': 'image', 'clip': 'clip', 'text': 'message', 'imdb': 'link'}
+
+def summary(groups):
+    """One reply per post, in the post's own order:
+         📌 <what the post is>
+         1. Title (year) · Movie — ✅ added
+       so it's obvious which post each answer belongs to and what happened to every title."""
+    out = []
+    for g in groups:
+        head = g['label'] or ''
+        rows = g['rows']
+        if not rows:
+            out.append((f'📌 {head}\n' if head else '') + f"❓ No movie or series found in this {KIND.get(g['how'], 'post')}. Reply with the title and I'll add it.")
+            continue
+        if len(rows) == 1 and not head:
+            out.append(f'{rows[0][0]} — {STATUS[rows[0][1]]}'); continue
+        lines = [f'📌 {head}' + (f' · {len(rows)} titles' if len(rows) > 1 else '')] if head else []
+        lines += [f'{n}. {t} — {STATUS[st]}' if len(rows) > 1 else f'{t} — {STATUS[st]}' for n, (t, st) in enumerate(rows, 1)]
+        out.append('\n'.join(lines))
+    return '\n\n'.join(out)
 
 def chat_context(msgs, upto, n=12):
     prev = [x for x in msgs if x.get('timestamp', 0) < upto.get('timestamp', 0)][-n:]
@@ -209,42 +260,46 @@ def process(db, m, msgs=()):
     body = (m.get('body') or '').strip()
     if body.startswith(BOT) or body.startswith('[reaction'): return
     caption = '' if body in ('[image]', '[video]') else body
+    say = lambda text: reply(text, m)
     if body.startswith('-') and len(body) > 2 and not m.get('hasMedia'):   # quick removal: "-rocky"
         gone = remove_titles(db, [body[1:].strip()])
-        reply(f'Removed {", ".join(gone)}' if gone else f"Nothing on the list matches \"{body[1:].strip()}\".")
+        say(f'🗑️ Removed {", ".join(gone)}' if gone else f'Nothing on the list matches "{body[1:].strip()}".')
         return
+    groups = []          # [{label, how, found}] — one per link / image / text part, in message order
     if m.get('hasMedia'):
         try: path = subprocess.run([NODE, HELPER, m['id'], MEDIA], capture_output=True, text=True, timeout=180,
                                    cwd=os.path.dirname(HELPER)).stdout.strip()
         except Exception: path = ''
-        if not path: reply("Couldn't download that file from WhatsApp — send it again or type the title."); return
-        found, how = (ident.identify_video(path, caption), 'clip') if path.endswith('.mp4') else (ident.identify_image(path, caption), 'image')
+        if not path: say("❓ Couldn't download that file from WhatsApp — send it again or type the title."); return
+        how = 'clip' if path.endswith('.mp4') else 'image'
+        found, lab = (ident.identify_video if how == 'clip' else ident.identify_image)(path, caption)
+        groups.append({'label': lab if len(found) > 1 else '', 'src': lab, 'how': how, 'found': found})
     elif (links := SOCIAL.findall(body)) and not re.search(r'tt\d{6,9}', body):
-        found, how = [r for u in links for r in ident.identify_reel(u)], 'reel'
+        for u in links:
+            found, lab = ident.identify_reel(u)
+            groups.append({'label': lab or 'Shared post', 'how': 'reel', 'found': found})
         rest = SOCIAL.sub(' ', body).strip()
         if len(rest) > 3:   # "…/reel/xyz and also add Dune" → handle the text part too
             action, titles = ident.read_text(rest, chat_context(msgs, m))
-            if action == 'add': found += ident.resolve_all(titles)
+            if action == 'add': groups.append({'label': f'Your text: "{rest[:60]}"', 'how': 'text', 'found': ident.resolve_all(titles)})
     elif (tt := re.search(r'tt\d{6,9}', body)):
-        r = ident.cinemeta('movie', tt.group()); found, how = ([r] if r else []), 'imdb'
+        r = ident.cinemeta('movie', tt.group()); groups.append({'label': '', 'how': 'imdb', 'found': [r] if r else []})
     elif body:
         action, titles = ident.read_text(body, chat_context(msgs, m))
         if action == 'none': return            # chit-chat / feedback: stay quiet
         if action == 'remove':
             gone = remove_titles(db, [t.get('title', '') for t in titles])
-            reply(f'Removed {", ".join(gone)}' if gone else "Couldn't find those on the list."); return
-        found, how = ident.resolve_all(titles), 'text'
+            say(f'🗑️ Removed {", ".join(gone)}' if gone else "Couldn't find those on the list."); return
+        groups.append({'label': '', 'how': 'text', 'found': ident.resolve_all(titles)})
     else: return
-    if not found:
-        reply(f"Couldn't find a movie or series in that {how}. Send the title as text and I'll add it."); return
-    added, dup, junk = [], [], []
-    for typ, meta in found:
-        {'added': added, 'dup': dup, 'junk': junk}[add_item(db, typ, meta, how)].append(label(typ, meta))
-    lines = []
-    if added: lines.append('Added to Stremio →\n' + '\n'.join(f'• {a}' for a in added) if len(added) > 1 else f'Added to Stremio → {added[0]}')
-    if dup: lines.append('Already on the list: ' + ', '.join(d.split(' (')[0] for d in dup))
-    if junk: lines.append('Skipped (talk show/news namesake): ' + ', '.join(j.split(' (')[0] for j in junk))
-    reply('\n'.join(lines))
+    pos = 0
+    for g in groups:
+        g['rows'] = []
+        for typ, meta in g['found']:
+            st = add_item(db, typ, meta, g['how'], g.get('src') or g['label'] or (body[:60] if g['how'] == 'text' else ''), pos)
+            pos += st == 'added'
+            g['rows'].append((label(typ, meta), st))
+    say(summary(groups))
 
 def poll():
     first = not os.path.exists(DB)
