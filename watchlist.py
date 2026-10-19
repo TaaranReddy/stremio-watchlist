@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """WhatsApp "🎬 Watchlist" group → Stremio catalog addon. Stdlib only, zero cloud tokens.
 
-Drop anything in the group: a title ("rocky"), an IMDb link, a caption, or a screenshot/poster.
-  text/link  → Cinemeta search (Stremio's own free metadata API)
-  image      → tesseract OCR → Cinemeta; no hit → local Ollama vision (qwen2.5vl:7b, ₹0)
-  "-rocky"   → removes the item
+Drop anything in the group: a title or list of titles, an IMDb link, a screenshot/poster, a clip,
+or an Instagram/TikTok/YouTube reel. ident.py reads ALL the evidence (caption, Apple OCR of the frames,
+Whisper transcript, key frames) and adds every title the post recommends — see ident.py.
+  "-rocky" / "remove rocky" → removes the item
 The bot confirms in the group with a 🤖-prefixed reply (those are ignored on re-read).
 Stremio shows two rows on Board/Discover: "🎬 WhatsApp Watchlist" (Movies / Series).
 """
 import base64, difflib, json, os, re, subprocess, threading, time, urllib.parse, urllib.request
-import recs
+import recs, ident
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser('~')
@@ -42,6 +42,8 @@ def publish(db):
         for mode in ('recent', 'watched', 'continue'):
             json.dump(library_catalog(db.get('library', []), typ, mode),
                       open(f'{docs}/catalog/{typ}/{mode}.json', 'w'), ensure_ascii=False)
+        json.dump(netflix_catalog(typ), open(f'{docs}/catalog/{typ}/netflix.json', 'w'), ensure_ascii=False)
+        json.dump(seen_catalog(db, typ), open(f'{docs}/catalog/{typ}/seen.json', 'w'), ensure_ascii=False)
     open(f'{docs}/.nojekyll', 'w').close()
     env = {**os.environ, 'DEVELOPER_DIR': '/Library/Developer/CommandLineTools'}  # Xcode licence prompt breaks /usr/bin/git
     git = lambda *a: subprocess.run(['git', '-C', DIR, *a], capture_output=True, text=True, timeout=60, env=env)
@@ -87,6 +89,49 @@ def library_catalog(items, typ, mode):
     return {'metas': out}
 
 
+NETFLIX_DB = os.path.join(DIR, 'netflix-watched.json')
+
+def netflix_items():
+    """Taaran's imported Netflix viewing history (profile A), newest first."""
+    try:
+        return json.load(open(NETFLIX_DB))
+    except Exception:
+        return []
+
+def _nflx_meta(i, label):
+    m = {'id': i['id'], 'type': i.get('type'), 'name': i.get('name') or i['id'],
+         'poster': i.get('poster') or recs.RPDB.format(i['id']),
+         'description': label + (f" · last watched {i['last_seen']}" if i.get('last_seen') else '')}
+    if i.get('year'):
+        m['releaseInfo'] = str(i['year'])
+    return m
+
+def netflix_catalog(typ):
+    """What he watched on Netflix — imported from the profile's viewing activity."""
+    return {'metas': [_nflx_meta(i, '🍿 Watched on Netflix')
+                      for i in netflix_items() if i.get('type') == typ and str(i.get('id', '')).startswith('tt')]}
+
+def seen_catalog(db, typ):
+    """Everything he has seen: Stremio's own watched flags unioned with the Netflix import."""
+    out, have = [], set()
+    lib = sorted(db.get('library', []), key=lambda x: (x.get('state') or {}).get('lastWatched', ''), reverse=True)
+    for i in lib:
+        st = i.get('state') or {}
+        if i.get('type') != typ or not str(i.get('_id', '')).startswith('tt'):
+            continue
+        if not ((st.get('flaggedWatched') or 0) > 0 or (st.get('timesWatched') or 0) > 0):
+            continue
+        have.add(i['_id'])
+        out.append({'id': i['_id'], 'type': typ, 'name': i.get('name') or i['_id'],
+                    'poster': recs.RPDB.format(i['_id']), 'description': '✓ Watched in Stremio'})
+    for i in netflix_items():
+        if i.get('type') != typ or not str(i.get('id', '')).startswith('tt') or i['id'] in have:
+            continue
+        have.add(i['id'])
+        out.append(_nflx_meta(i, '🍿 Watched on Netflix'))
+    return {'metas': out}
+
+
 def refresh(db):
     """Enrich watchlist, rebuild history rows and For You recommendations."""
     try:
@@ -108,40 +153,9 @@ def get(url, data=None, timeout=20):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 def log(*a): print(time.strftime('%H:%M:%S'), *a, flush=True)
+ident.log = log
 
 # ─── identification ─────────────────────────────────────────────────────────
-def cinemeta_meta(tt):
-    for typ in ('movie', 'series'):
-        try:
-            m = get(f'https://v3-cinemeta.strem.io/meta/{typ}/{tt}.json').get('meta')
-            if m and m.get('name'): return typ, m
-        except Exception: pass
-    return None
-
-def search(q, hint=None):
-    """Best Cinemeta hit for q across movie+series, with a similarity score."""
-    q = re.sub(r'\s+', ' ', q).strip()
-    if len(q) < 2: return None
-    per_type = {}
-    for typ in ('movie', 'series'):
-        try: metas = get(f'https://v3-cinemeta.strem.io/catalog/{typ}/top/search={urllib.parse.quote(q)}.json').get('metas', [])
-        except Exception: continue
-        for rank, m in enumerate(metas[:5]):
-            name = m['name'].lower()
-            sim = difflib.SequenceMatcher(None, q.lower(), name).ratio()
-            if name.startswith(q.lower() + ':') or name.startswith(q.lower() + ' -'): sim = max(sim, 0.9)  # "Frieren: Beyond…"
-            score = sim - rank * 0.03 + (0.1 if hint == typ else 0)
-            if typ not in per_type or score > per_type[typ][0]: per_type[typ] = (score, typ, m, sim)
-    cands = [c for c in per_type.values() if c[3] >= 0.5]
-    if hint and hint in per_type and per_type[hint][3] >= 0.6: return per_type[hint]  # "anime"/"series"/"movie" said explicitly
-    if len(cands) == 2 and not hint and abs(cands[0][0] - cands[1][0]) < 0.15:
-        # movie-vs-series near tie ("frieren"): obscure namesakes lose to the popular title
-        def pop(c):
-            try: return get(f'https://v3-cinemeta.strem.io/meta/{c[1]}/{c[2]["id"]}.json')['meta'].get('popularities', {}).get('moviedb', 0) or 0
-            except Exception: return 0
-        return max(cands, key=pop)
-    return max(per_type.values(), default=None, key=lambda c: c[0])
-
 SOCIAL = re.compile(r'https?://(?:www\.)?(?:instagram\.com|tiktok\.com|youtube\.com|youtu\.be|x\.com|twitter\.com|facebook\.com|fb\.watch)/\S+', re.I)
 
 # Titles that share a name with a real film/series but are never what someone means
@@ -156,129 +170,81 @@ def popularity(typ, tid):
     try: return get(f'https://v3-cinemeta.strem.io/meta/{typ}/{tid}.json')['meta'].get('popularities', {}).get('moviedb', 0) or 0
     except Exception: return 0
 
-def link_info(url):
-    """Reel/short → (caption text, thumbnail path). yt-dlp first; og:image scrape for restricted posts."""
-    text, thumb = '', ''
-    try:
-        r = subprocess.run(['yt-dlp', '--skip-download', '-J', url], capture_output=True, text=True, timeout=60)
-        if r.returncode == 0:
-            j = json.loads(r.stdout); text = '\n'.join(x for x in [j.get('description') or '', j.get('title') or ''] if x)
-            thumb = j.get('thumbnail') or ''
-    except Exception as e: log('yt-dlp failed', e)
-    if not thumb:
-        try:
-            req = urllib.request.Request(url, headers={'user-agent': 'facebookexternalhit/1.1'})
-            html = urllib.request.urlopen(req, timeout=20).read().decode('utf-8', 'ignore')
-            for k in ('og:title', 'og:description'):
-                if (m := re.search(rf'property="{k}" content="([^"]*)"', html)): text += '\n' + __import__('html').unescape(m.group(1))
-            if (m := re.search(r'property="og:image" content="([^"]+)"', html)): thumb = m.group(1).replace('&amp;', '&')
-        except Exception as e: log('og scrape failed', e)
-    path = ''
-    if thumb:
-        try:
-            path = os.path.join(MEDIA, re.sub(r'\W', '_', url)[-60:] + '.jpg')
-            urllib.request.urlretrieve(thumb, path)
-        except Exception: path = ''
-    return text, path
-
-def identify_link(url):
-    text, path = link_info(url)
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    cands = []
-    for l in lines[:15]:   # "🎬 The Notebook (2004)" / "Movie: X" / "#movietitle"
-        if (m := re.search(r'(?:🎬|🎥|🍿|movie\s*[:\-]|film\s*[:\-]|series\s*[:\-]|title\s*[:\-])\s*([^\n(|#]{2,60}?)\s*(?:\((\d{4})\))?(?:$|[|#\n])', l, re.I)):
-            cands.append(m.group(1))
-        cands += re.findall(r'^\s*([A-Z][^\n()]{1,50}?)\s*\((\d{4})\)', l) and [re.findall(r'^\s*([A-Z][^\n()]{1,50}?)\s*\((\d{4})\)', l)[0][0]] or []
-    for c in cands:
-        if (b := search(c)) and b[3] >= 0.6: return (b[1], b[2]), 'reel-caption'
-    if path:
-        hits = [b for l in ocr_lines(path) if (b := search(l)) and b[3] >= 0.75]
-        if hits: b = max(hits, key=lambda x: x[0]); return (b[1], b[2]), 'reel-ocr'
-        if (g := vision_guess(path)) and (b := search(g)) and b[3] >= 0.5: return (b[1], b[2]), f'reel-vision:{g}'
-    return None, 'reel'
-
-def identify_text(text):
-    tt = re.search(r'tt\d{6,9}', text)
-    if tt and (r := cinemeta_meta(tt.group())): return r
-    hint = 'series' if re.search(r'\b(series|show|season|anime|tv|s\d+e\d+)\b', text, re.I) else (
-           'movie' if re.search(r'\bmovie|film\b', text, re.I) else None)
-    clean = re.sub(r'https?://\S+|\b(watch|movie|film|series|show|anime|season \d+|recommend(ed)?|must|this)\b', ' ', text, flags=re.I)
-    best = search(clean, hint)
-    return (best[1], best[2]) if best and best[3] >= 0.5 else None
-
-def ocr_lines(path):
-    try: out = subprocess.run(['tesseract', path, '-', '--psm', '3'], capture_output=True, text=True, timeout=60).stdout
-    except Exception: return []
-    lines = [re.sub(r'[^\w\s:&\'-]', '', l).strip() for l in out.splitlines()]
-    return sorted({l for l in lines if 3 <= len(l) <= 60 and sum(c.isalpha() for c in l) >= 3}, key=len, reverse=True)[:6]
-
-def vision_guess(path):
-    try:
-        b64 = base64.b64encode(open(path, 'rb').read()).decode()
-        r = get('http://127.0.0.1:11434/api/generate', {
-            'model': CFG.get('vision_model', 'qwen2.5vl:7b'), 'stream': False, 'images': [b64],
-            'options': {'num_predict': 30, 'temperature': 0},
-            'prompt': 'This is a screenshot, poster or still from a movie, TV series or anime. '
-                      'Reply with ONLY its official English title, nothing else. If unknown reply UNKNOWN.'}, timeout=180)
-        g = r.get('response', '').strip().strip('"*.').splitlines()[0] if r.get('response') else ''
-        return '' if 'UNKNOWN' in g.upper() else g
-    except Exception as e:
-        log('vision failed', e); return ''
-
-def identify_image(msg_id, caption):
-    if caption and caption not in ('[image]', '[video]') and (r := identify_text(caption)): return r, 'caption'
-    try: path = subprocess.run([NODE, HELPER, msg_id, MEDIA], capture_output=True, text=True, timeout=60,
-                               cwd=os.path.dirname(HELPER)).stdout.strip()
-    except Exception: path = ''
-    if not path: return None, 'no-media'
-    hits = [b for l in ocr_lines(path) if (b := search(l)) and b[3] >= 0.75]
-    if hits:
-        b = max(hits, key=lambda x: x[0]); return (b[1], b[2]), 'ocr'
-    if (g := vision_guess(path)) and (b := search(g)) and b[3] >= 0.5: return (b[1], b[2]), f'vision:{g}'
-    return None, 'unrecognised'
-
 # ─── poll loop ──────────────────────────────────────────────────────────────
 def reply(text):
     try: get(f'{BRIDGE}/send', {'chatId': GROUP, 'message': f'{BOT} {text}'})
     except Exception as e: log('reply failed', e)
 
-def process(db, m):
-    body = (m.get('body') or '').strip()
-    if body.startswith(BOT) or body.startswith('[reaction'): return
-    if body.startswith('-') and len(body) > 2:   # removal
-        q = body[1:].strip().lower()
-        hit = max(db['items'], default=None, key=lambda i: difflib.SequenceMatcher(None, q, i['name'].lower()).ratio())
-        if hit and difflib.SequenceMatcher(None, q, hit['name'].lower()).ratio() > 0.5:
-            db['items'].remove(hit); reply(f'Removed {hit["name"]}')
-        return
-    if m.get('hasMedia'): res, how = identify_image(m['id'], body)
-    elif body and (sm := SOCIAL.search(body)) and not re.search(r'tt\d{6,9}', body):
-        rest = SOCIAL.sub(' ', body).strip()
-        res, how = (identify_text(rest), 'text') if len(rest) > 2 else (None, '')
-        if not res: res, how = identify_link(sm.group())
-    elif body: res, how = identify_text(body), 'text'
-    else: return
-    if not res:
-        reply(f"Couldn't identify that ({how}). Send the title as text and I'll add it."); return
-    typ, meta = res
-    if any(i['id'] == meta['id'] for i in db['items']):
-        reply(f'Already on the list: {meta["name"]}'); return
-    fuzzy = how.split(':')[0] in ('ocr', 'vision', 'link', 'caption')
-    if fuzzy and is_junk(meta):
-        # a poster matched a talk show / news / reality namesake: never the intended title
-        reply(f'That matched a {", ".join(meta.get("genres") or [])} — not adding it. Send the exact title if that was wrong.')
-        return
+def add_item(db, typ, meta, how):
+    """→ 'added' | 'dup' | 'junk'. Keeps one entry per title, drops talk-show/news namesakes."""
+    if any(i['id'] == meta['id'] for i in db['items']): return 'dup'
+    if is_junk(meta): return 'junk'
     twin = next((i for i in db['items'] if i['name'].lower() == meta['name'].lower() and i['type'] != typ), None)
     if twin:
-        # same title already stored as the other type — keep the real one, drop the namesake
-        if is_junk(meta) or (not is_junk(twin) and popularity(twin['type'], twin['id']) >= popularity(typ, meta['id'])):
-            reply(f'Already on the list: {twin["name"]} ({twin["type"]})'); return
+        if not is_junk(twin) and popularity(twin['type'], twin['id']) >= popularity(typ, meta['id']): return 'dup'
         db['items'].remove(twin); log('dropped namesake', twin['name'], twin['type'], twin['id'])
     db['items'].insert(0, {'id': meta['id'], 'type': typ, 'name': meta['name'], 'poster': meta.get('poster'),
                            'year': meta.get('releaseInfo') or meta.get('year'), 'added': int(time.time()), 'via': how,
                            'rating': meta.get('imdbRating'), 'genres': meta.get('genres') or []})
     log('added', meta['name'], typ, how)
-    reply(f'Added to Stremio → {meta["name"]} ({meta.get("releaseInfo") or meta.get("year") or "?"}) · {"Series" if typ == "series" else "Movie"}')
+    return 'added'
+
+def label(typ, meta):
+    return f'{meta["name"]} ({meta.get("releaseInfo") or meta.get("year") or "?"}) · {"Series" if typ == "series" else "Movie"}'
+
+def chat_context(msgs, upto, n=12):
+    prev = [x for x in msgs if x.get('timestamp', 0) < upto.get('timestamp', 0)][-n:]
+    return '\n'.join(('[image]' if x.get('hasMedia') and not (x.get('body') or '').strip('[]imagevido') else (x.get('body') or ''))[:300]
+                     for x in prev if (x.get('body') or x.get('hasMedia')))
+
+def remove_titles(db, names):
+    gone = []
+    for q in names:
+        hit = max(db['items'], default=None, key=lambda i: ident._sim(q, i['name']))
+        if hit and ident._sim(q, hit['name']) > 0.6:
+            db['items'].remove(hit); gone.append(hit['name'])
+    return gone
+
+def process(db, m, msgs=()):
+    body = (m.get('body') or '').strip()
+    if body.startswith(BOT) or body.startswith('[reaction'): return
+    caption = '' if body in ('[image]', '[video]') else body
+    if body.startswith('-') and len(body) > 2 and not m.get('hasMedia'):   # quick removal: "-rocky"
+        gone = remove_titles(db, [body[1:].strip()])
+        reply(f'Removed {", ".join(gone)}' if gone else f"Nothing on the list matches \"{body[1:].strip()}\".")
+        return
+    if m.get('hasMedia'):
+        try: path = subprocess.run([NODE, HELPER, m['id'], MEDIA], capture_output=True, text=True, timeout=180,
+                                   cwd=os.path.dirname(HELPER)).stdout.strip()
+        except Exception: path = ''
+        if not path: reply("Couldn't download that file from WhatsApp — send it again or type the title."); return
+        found, how = (ident.identify_video(path, caption), 'clip') if path.endswith('.mp4') else (ident.identify_image(path, caption), 'image')
+    elif (links := SOCIAL.findall(body)) and not re.search(r'tt\d{6,9}', body):
+        found, how = [r for u in links for r in ident.identify_reel(u)], 'reel'
+        rest = SOCIAL.sub(' ', body).strip()
+        if len(rest) > 3:   # "…/reel/xyz and also add Dune" → handle the text part too
+            action, titles = ident.read_text(rest, chat_context(msgs, m))
+            if action == 'add': found += ident.resolve_all(titles)
+    elif (tt := re.search(r'tt\d{6,9}', body)):
+        r = ident.cinemeta('movie', tt.group()); found, how = ([r] if r else []), 'imdb'
+    elif body:
+        action, titles = ident.read_text(body, chat_context(msgs, m))
+        if action == 'none': return            # chit-chat / feedback: stay quiet
+        if action == 'remove':
+            gone = remove_titles(db, [t.get('title', '') for t in titles])
+            reply(f'Removed {", ".join(gone)}' if gone else "Couldn't find those on the list."); return
+        found, how = ident.resolve_all(titles), 'text'
+    else: return
+    if not found:
+        reply(f"Couldn't find a movie or series in that {how}. Send the title as text and I'll add it."); return
+    added, dup, junk = [], [], []
+    for typ, meta in found:
+        {'added': added, 'dup': dup, 'junk': junk}[add_item(db, typ, meta, how)].append(label(typ, meta))
+    lines = []
+    if added: lines.append('Added to Stremio →\n' + '\n'.join(f'• {a}' for a in added) if len(added) > 1 else f'Added to Stremio → {added[0]}')
+    if dup: lines.append('Already on the list: ' + ', '.join(d.split(' (')[0] for d in dup))
+    if junk: lines.append('Skipped (talk show/news namesake): ' + ', '.join(j.split(' (')[0] for j in junk))
+    reply('\n'.join(lines))
 
 def poll():
     first = not os.path.exists(DB)
@@ -291,7 +257,7 @@ def poll():
                     if m['id'] in seen: continue
                     seen.add(m['id'])
                     if not first:
-                        try: process(db, m)
+                        try: process(db, m, msgs)
                         except Exception as e: log('process error', m['id'], e)
                 db['seen'] = list(seen)[-2000:]; save(db); first = False
                 changed = json.dumps(db['items']) != before
@@ -302,14 +268,18 @@ def poll():
 
 # ─── Stremio addon ──────────────────────────────────────────────────────────
 MANIFEST = {
-    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.2.0', 'name': '🎬 Taaran Library',
-    'description': 'Reliable Stremio history, Continue Watching, completed titles, WhatsApp Watchlist and For You picks.',
+    'id': 'in.taaran.whatsapp-watchlist', 'version': '1.3.0', 'name': '🎬 Taaran Library',
+    'description': 'Reliable Stremio history, Continue Watching, completed titles, Netflix import, WhatsApp Watchlist and For You picks.',
     'resources': ['catalog'], 'types': ['movie', 'series'], 'idPrefixes': ['tt'],
     'catalogs': [
         {'type': 'movie', 'id': 'continue', 'name': '▶️ Continue Watching'},
         {'type': 'series', 'id': 'continue', 'name': '▶️ Continue Watching'},
         {'type': 'movie', 'id': 'watched', 'name': '✅ Watched Movies'},
         {'type': 'series', 'id': 'watched', 'name': '✅ Watched Series'},
+        {'type': 'movie', 'id': 'seen', 'name': '👀 Everything Seen'},
+        {'type': 'series', 'id': 'seen', 'name': '👀 Everything Seen'},
+        {'type': 'movie', 'id': 'netflix', 'name': '🍿 Watched on Netflix'},
+        {'type': 'series', 'id': 'netflix', 'name': '🍿 Watched on Netflix'},
         {'type': 'movie', 'id': 'recent', 'name': '🕘 Recently Watched'},
         {'type': 'series', 'id': 'recent', 'name': '🕘 Recently Watched'},
         {'type': 'movie', 'id': 'wa-watchlist', 'name': '🎬 WhatsApp Watchlist'},
@@ -332,10 +302,12 @@ class H(BaseHTTPRequestHandler):
         if not parts or parts[0] != TOKEN: return self.send({'err': 'not found'}, 404)
         rest = '/'.join(parts[1:])
         if rest == 'manifest.json': return self.send(MANIFEST)
-        if (mt := re.fullmatch(r'catalog/(movie|series)/(wa-watchlist|for-you|recent|watched|continue)(?:/[^/]*)?\.json', rest)):
+        if (mt := re.fullmatch(r'catalog/(movie|series)/(wa-watchlist|for-you|recent|watched|continue|netflix|seen)(?:/[^/]*)?\.json', rest)):
             with lock: db = load()
             cat = mt.group(2)
             if cat == 'for-you': return self.send({'metas': db.get('recs', {}).get(mt.group(1), [])})
+            if cat == 'netflix': return self.send(netflix_catalog(mt.group(1)))
+            if cat == 'seen': return self.send(seen_catalog(db, mt.group(1)))
             if cat in ('recent', 'watched', 'continue'):
                 return self.send(library_catalog(db.get('library', []), mt.group(1), cat))
             return self.send(catalog(db['items'], mt.group(1)))
